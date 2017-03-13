@@ -3,149 +3,179 @@
 require 'fileutils'
 require 'inifile'
 
-class ConfigurationSettings
+class Settings
+    attr_reader :configuration
     def initialize(iniFilePath)
-        puts iniFilePath
-        @ini_content = IniFile.new(:filename => iniFilePath, :parameter => '=', :comment => [';','#'])
-        puts @ini_content
+        ini_content = IniFile.new(:filename => iniFilePath, :parameter => '=', :comment => [';','#'])
+        @configuration = ini_content['CONFIG']
+    end
+
+    # Define on self, since it's  a class method
+    def method_missing(method_sym, *arguments, &block)
+        # the first argument is a Symbol, so you need to_s it if you want to pattern match
+        methodString = method_sym.to_s
+        if @configuration.keys.include? methodString
+            @configuration[methodString]
+        else
+            super
+        end
     end
 end
 
-
-def checkAndCompile(directory, is_dist_clean)
-    Dir.chdir(directory)
-
-    #Handle better the access to the git function
-    describe = `git describe --long --dirty`
-    is_git   = !describe.include?("fatal")
-    is_dirty = describe.include? "dirty"
-=begin
-    if  !is_git or is_dirty 
-        abort "Sorry there's something wrong with the directory #{Dir.pwd}"
+class LibraryCompiler
+    attr_reader :describe, :library_home
+    def initialize(libraryDirectory)
+        @library_home = libraryDirectory
+        makeDirectory = `find #{libraryDirectory} -maxdepth 1 -name \"*.pro\"`
+        makeDirectory = makeDirectory.split
+        if makeDirectory.size == 0
+            makeDirectory = `find #{libraryDirectory} -maxdepth 2 -name \"*.pro\"`
+            makeDirectory = makeDirectory.split
+            selected = makeDirectory.select{|s| !s.downcase.include? 'demo'}     
+            puts "Selected #{selected}" 
+            Dir.chdir(File.dirname(selected.first))
+        else
+            selected = makeDirectory
+            puts "Selected #{selected}" 
+            Dir.chdir(File.dirname(selected.first))
+        end
+        @describe = `git describe --long --dirty`
     end
-=end
-    if is_dist_clean
+
+    def versioned?()
+       return (!@describe.include?("fatal"))
+    end
+
+    def dirty?()
+        return @describe.include? "dirty"
+    end
+
+    def distclean
+        `make distclean`
+    end
+
+    def generateQMake(qmake)
+        `#{qmake} \"CONFIG*=debug_and_release debug_and_release_target build_all\"`
+    end
+
+    def compile()
+        puts "Compiling Library"
+        system("make all -j4")
+    end
+
+    def createKit()
+        puts "Creating Kit #{@library_home}" 
+        Dir.chdir(@library_home)
+        `find #{Dir.pwd} -name \"*tar.gz\" -exec rm \{\} \\;`    
+        `find #{Dir.pwd} -name \"createKit.sh\" -exec \{\} \\; &` 
+    end
+
+    def install(destination)
+        kits = `find #{Dir.pwd} -name \"*tar.gz\"`
+        puts "KIT FOUND #{kits}"
+
+        kits.split.each do |k|
+            current_dir = Dir.pwd
+             Dir.chdir(destination)
+            `tar xzf #{k}`
+            Dir.chdir(current_dir)
+        end
+        
+    end
+
+    def build(settings, distClean = false)
+        if distClean
+            puts "I'am in #{Dir.pwd}"
+            self.distclean
+        end
+
+        puts "Generating QMAKE"
+        self.generateQMake(settings.qmake)
+        self.compile
+        self.createKit
+    end
+end
+
+class EltIpcCompiler < LibraryCompiler
+    def initialize(libraryDirectory)
+        @library_home = libraryDirectory
+        @amqp_dir = File.expand_path("qamqp/src", @library_home)
+        proFile = `find -name \"Ipc.pro\"`
+        @ipc_pro = File.dirname(proFile) 
+        Dir.chdir(@library_home)
+        @describe = `git describe --long --dirty`
+    end
+    
+    def compileAmqp(qmake)
+        Dir.chdir(@amqp_dir)
         system("make distclean")
+        `#{qmake} \"src\.pro\" \"CONFIG+=debug_and_release QAMQP_LIBRARY_TYPE=staticlib\"`
+        system("make all -j4")
+        `find -name \".qmake.stash\" -exec rm \{\} \\;`
     end
 
-    `/opt/Qt5.6.1/5.6/gcc_64/bin/qmake \"CONFIG+=debug_and_release debug_and_release_target build_all\"`
-
-    system("make -j4")
-end
-
-
-def cleanDsp(dsp_dir)
-    Dir.chdir("#{dsp_dir}/extResources")
-    if File.directory?("#{Dir.pwd}/eltGraphs")
-        FileUtils.remove_dir("eltGraphs")
-    end
-
-    if File.directory?("#{Dir.pwd}/eltElintGraphs")
-        FileUtils.remove_dir("eltElintGraphs")
+    def generateQMake(qmake)
+        compileAmqp(qmake)
+        Dir.chdir(@ipc_pro)
+        `#{qmake} \"CONFIG+=debug_and_release\"`
     end
 end
 
 
-
-c = ConfigurationSettings.new("/home/laboratorio/Projects/libraryBuilder.ini")
-exit(1)
-
-
-home_content = Dir.entries(Dir.home)
-
-if not home_content.include?("Projects")
-    abort "Can't find Projects dir"
-end
-
-puts "Entering in Projects directory"
-Dir.chdir("#{Dir.home}/Projects/")
-
-puts "Looking for Elt Libraries"
-dsp_dirs = Array.new
-for entry in Dir.entries(Dir.pwd)
-    downcased = entry.downcase
-    if downcased.include?("elt") and downcased.include?("graphs") and not downcased.include?("elint")
-        elt_graphs_dir  = File.expand_path(entry, Dir.pwd)
-        puts "\tFound #{entry}"
+class LibraryDeployer
+    attr_reader :libs
+    def initialize(configurationFile)
+        @settings = Settings.new(configurationFile)
+        @libs = @settings.configuration.keys.select{|key| not(key.include? "qmake" or key.include? "Resources")}
     end
     
-    if downcased.include?("elint") and downcased.include?("graphs")
-        elt_elint_graphs_dir = File.expand_path(entry, Dir.pwd)
-        puts "\tFound #{entry}"
-    end    
     
-    if downcased =~ /aers(.*)hmi(.*)dsp(.*)/
-        dsp_dirs.push(entry)
+    def removeLibraries(libraryList)
+        Dir.chdir(File.expand_path(@settings.extResources()))
+
+        libraryList.each do |lib|
+            if(File.directory?(File.expand_path(lib, Dir.pwd))) 
+                puts "Removing #{lib}"
+                FileUtils.remove_dir(lib)
+            else
+                puts "Library #{lib} not found"
+            end 
+        end
+    end
+
+    def deploy(distClean = false)
+        #eltIpc
+        eltIpc = EltIpcCompiler.new(@settings.eltIpc)
+        eltIpc.build(@settings, distClean)
+        eltIpc.install(@settings.extResources)
+
+        #eltGraphs
+        eltGraphs = LibraryCompiler.new(@settings.eltGraphs)
+        eltGraphs.build(@settings, distClean)
+        eltElintGraphsExtResources = File.expand_path("ELT_ELINT_GRAPHS_LIB/ext_resources", @settings.eltElintGraphs)
+        #eltGraphs.install(eltElintGraphsExtResources)
+        eltGraphs.install(@settings.extResources)
+        
+        #eltElintGraphs
+        eltElintGraphs = LibraryCompiler.new(@settings.eltElintGraphs)
+        eltElintGraphs.build(@settings, distClean)
+        eltElintGraphs.install(@settings.extResources)
+
+        #hmiCommon
+        hmiCommon = LibraryCompiler.new(@settings.hmiCommon)
+        hmiCommon.build(@settings, distClean)
+        hmiCommon.install(@settings.extResources)
+
+        #hmiInterface
+        hmiInterface = LibraryCompiler.new(@settings.hmiInterface)
+        hmiInterface.build(@settings, distClean)
+        hmiInterface.install(@settings.extResources)
     end
 end
 
-puts
-if dsp_dirs.count > 0
-    print "I found the following AERS HMI DSP directories "
-    print dsp_dirs
-    print " pleaselease select one: "
-end
-
-hmi_dsp_dir = ""
-loop do
-    answer = gets.chomp
-    hmi_dsp_dir = File.expand_path(answer, Dir.pwd)
-    break if dsp_dirs.include?(answer)
-end
-
-print "Do you want to perform a deep clean? ([Y/N])"
-is_dist_clean = gets.chomp.downcase.eql?("y")
-
-checkAndCompile(elt_graphs_dir, is_dist_clean)
-Dir.chdir("./scripts")
-puts `./createKit.sh &`
-
-
-Dir.chdir("#{elt_elint_graphs_dir}/ELT_ELINT_GRAPHS_LIB/ext_resources")
-if File.directory?("#{Dir.pwd}/eltGraphs")
-    FileUtils.remove_dir("eltGraphs")
-end
-
-fileName = ""
-for file in Dir.entries("#{elt_graphs_dir}/scripts")
-    if file =~ /eltGraphs(.+)\.tar\.gz/
-        fileName = file
-    end
-end
-
-if !fileName.empty?
-    system("tar xzf #{elt_graphs_dir}/scripts/#{fileName}")
-else
-     abort "File Not Found"
-end
-
-
-checkAndCompile("#{elt_elint_graphs_dir}/ELT_ELINT_GRAPHS_LIB", is_dist_clean)
-
-Dir.chdir(File.expand_path("../scripts", Dir.pwd))
-
-puts `./prepare_include_dir.sh &`
-puts `./createKit.sh &`
-
-cleanDsp(hmi_dsp_dir)
-
-if !fileName.empty?
-    `tar xzf #{elt_graphs_dir}/scripts/#{fileName}`
-else
-     abort "File Not Found"
-end
-
-fileName = ""
-for file in Dir.entries("#{elt_elint_graphs_dir}/scripts")
-    if file =~ /eltElintGraphs(.+)\.tar\.gz/
-        fileName = file
-    end
-end
-
-if !fileName.empty?
-    `tar xzf #{elt_elint_graphs_dir}/scripts/#{fileName}`
-else
-     abort "File Not Found"
-end
-
+deployer = LibraryDeployer.new("./libraryBuilder.ini")
+libraryToRemove = deployer.libs
+libraryToRemove << "hmiCommonCore" << "hmiCommonGui"
+deployer.removeLibraries(libraryToRemove)
+deployer.deploy(true)
 
